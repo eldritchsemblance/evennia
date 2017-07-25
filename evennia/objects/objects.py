@@ -21,7 +21,7 @@ from evennia.commands.cmdsethandler import CmdSetHandler
 from evennia.commands import cmdhandler
 from evennia.utils import logger
 from evennia.utils.utils import (variable_from_module, lazy_property,
-                                 make_iter, to_unicode, calledby)
+                                 make_iter, to_unicode, calledby, is_iter)
 
 _MULTISESSION_MODE = settings.MULTISESSION_MODE
 
@@ -59,7 +59,7 @@ class ObjectSessionHandler(object):
         self._sessid_cache = list(set(int(val) for val in (self.obj.db_sessid or "").split(",") if val))
         if any(sessid for sessid in self._sessid_cache if sessid not in _SESSIONS):
             # cache is out of sync with sessionhandler! Only retain the ones in the handler.
-            self.sessid_cache = [sessid for sessid in self._sessid_cache if sessid in _SESSIONS]
+            self._sessid_cache = [sessid for sessid in self._sessid_cache if sessid in _SESSIONS]
             self.obj.db_sessid = ",".join(str(val) for val in self._sessid_cache)
             self.obj.save(update_fields=["db_sessid"])
 
@@ -547,21 +547,28 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
         for obj in contents:
             func(obj, **kwargs)
 
-    def msg_contents(self, message, exclude=None, from_obj=None, mapping=None, **kwargs):
+    def msg_contents(self, text=None, exclude=None, from_obj=None, mapping=None, **kwargs):
         """
         Emits a message to all objects inside this object.
 
         Args:
-            message (str): Message to send.
+            text (str or tuple): Message to send. If a tuple, this should be
+                on the valid OOB outmessage form `(message, {kwargs})`,
+                where kwargs are optional data passed to the `text`
+                outputfunc.
             exclude (list, optional): A list of objects not to send to.
             from_obj (Object, optional): An object designated as the
                 "sender" of the message. See `DefaultObject.msg()` for
                 more info.
             mapping (dict, optional): A mapping of formatting keys
                 `{"key":<object>, "key2":<object2>,...}. The keys
-                must match `{key}` markers in `message` and will be
+                must match `{key}` markers in the `text` if this is a string or
+                in the internal `message` if `text` is a tuple. These
+                formatting statements will be
                 replaced by the return of `<object>.get_display_name(looker)`
-                for every looker that is messaged.
+                for every looker in contents that receives the
+                message. This allows for every object to potentially
+                get its own customized string.
         Kwargs:
             Keyword arguments will be passed on to `obj.msg()` for all
             messaged objects.
@@ -575,15 +582,23 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
             not have `get_display_name()`, its string value will be used.
 
         Example:
-            Say char is a Character object and npc is an NPC object:
+            Say Char is a Character object and Npc is an NPC object:
 
-            action = 'kicks'
             char.location.msg_contents(
-                "{attacker} {action} {defender}",
-                mapping=dict(attacker=char, defender=npc, action=action),
-                exclude=(char, npc))
+                "{attacker} kicks {defender}",
+                mapping=dict(attacker=char, defender=npc), exclude=(char, npc))
+
+            This will result in everyone in the room seeing 'Char kicks NPC'
+            where everyone may potentially see different results for Char and Npc
+            depending on the results of `char.get_display_name(looker)` and
+            `npc.get_display_name(looker)` for each particular onlooker
 
         """
+        # we also accept an outcommand on the form (message, {kwargs})
+        is_outcmd = text and is_iter(text)
+        inmessage = text[0] if is_outcmd else text
+        outkwargs = text[1] if is_outcmd and len(text) > 1 else {}
+
         contents = self.contents
         if exclude:
             exclude = make_iter(exclude)
@@ -593,12 +608,14 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
                 substitutions = {t: sub.get_display_name(obj)
                                  if hasattr(sub, 'get_display_name')
                                  else str(sub) for t, sub in mapping.items()}
-                obj.msg(message.format(**substitutions), from_obj=from_obj, **kwargs)
+                outmessage = inmessage.format(**substitutions)
             else:
-                obj.msg(message, from_obj=from_obj, **kwargs)
+                outmessage = inmessage
+            obj.msg(text=(outmessage, outkwargs), from_obj=from_obj, **kwargs)
 
     def move_to(self, destination, quiet=False,
-                emit_to_obj=None, use_destination=True, to_none=False, move_hooks=True):
+                emit_to_obj=None, use_destination=True, to_none=False, move_hooks=True,
+                **kwargs):
         """
         Moves this object to a new location.
 
@@ -618,6 +635,9 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
             move_hooks (bool): If False, turn off the calling of move-related hooks
                 (at_before/after_move etc) with quiet=True, this is as quiet a move
                 as can be done.
+
+        Kwargs:
+          Passed on to announce_move_to and announce_move_from hooks.
 
         Returns:
             result (bool): True/False depending on if there were problems with the move.
@@ -656,7 +676,7 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
                 self.location = None
                 return True
             emit_to_obj.msg(_("The destination doesn't exist."))
-            return
+            return False
         if destination.destination and use_destination:
             # traverse exits
             destination = destination.destination
@@ -665,7 +685,7 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
         if move_hooks:
             try:
                 if not self.at_before_move(destination):
-                    return
+                    return False
             except Exception as err:
                 logerr(errtxt % "at_before_move()", err)
                 return False
@@ -684,7 +704,7 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
         if not quiet:
             # tell the old room we are leaving
             try:
-                self.announce_move_from(destination)
+                self.announce_move_from(destination, **kwargs)
             except Exception as err:
                 logerr(errtxt % "at_announce_move()", err)
                 return False
@@ -699,7 +719,7 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
         if not quiet:
             # Tell the new room we are there.
             try:
-                self.announce_move_to(source_location)
+                self.announce_move_to(source_location, **kwargs)
             except Exception as err:
                 logerr(errtxt % "announce_move_to()", err)
                 return False
@@ -1145,7 +1165,7 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
         # return has_perm(self, destination, "can_move")
         return True
 
-    def announce_move_from(self, destination):
+    def announce_move_from(self, destination, msg=None, mapping=None):
         """
         Called if the move is to be announced. This is
         called while we are still standing in the old
@@ -1153,25 +1173,56 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
 
         Args:
             destination (Object): The place we are going to.
+            msg (str, optional): a replacement message.
+            mapping (dict, optional): additional mapping objects.
+
+        You can override this method and call its parent with a
+        message to simply change the default message.  In the string,
+        you can use the following as mappings (between braces):
+            object: the object which is moving.
+            exit: the exit from which the object is moving (if found).
+            origin: the location of the object before the move.
+            destination: the location of the object after moving.
 
         """
         if not self.location:
             return
-        string = "%s is leaving %s, heading for %s."
-        location = self.location
-        for obj in self.location.contents:
-            if obj != self:
-                obj.msg(string % (self.get_display_name(obj),
-                                  location.get_display_name(obj) if location else "nowhere",
-                                  destination.get_display_name(obj)))
+        if msg:
+            string = msg
+        else:
+            string = "{object} is leaving {origin}, heading for {destination}."
 
-    def announce_move_to(self, source_location):
+        location = self.location
+        exits = [o for o in location.contents if o.location is location and o.destination is destination]
+        if not mapping:
+            mapping = {}
+
+        mapping.update({
+                "object": self,
+                "exit": exits[0] if exits else "somwhere",
+                "origin": location or "nowhere",
+                "destination": destination or "nowhere",
+        })
+
+        location.msg_contents(string, exclude=(self, ), mapping=mapping)
+
+    def announce_move_to(self, source_location, msg=None, mapping=None):
         """
         Called after the move if the move was not quiet. At this point
         we are standing in the new location.
 
         Args:
             source_location (Object): The place we came from
+            msg (str, optional): the replacement message if location.
+            mapping (dict, optional): additional mapping objects.
+
+        You can override this method and call its parent with a
+        message to simply change the default message.  In the string,
+        you can use the following as mappings (between braces):
+            object: the object which is moving.
+            exit: the exit from which the object is moving (if found).
+            origin: the location of the object before the move.
+            destination: the location of the object after moving.
 
         """
 
@@ -1182,13 +1233,31 @@ class DefaultObject(with_metaclass(TypeclassBase, ObjectDB)):
             self.location.msg(string)
             return
 
-        string = "%s arrives to %s%s."
-        location = self.location
-        for obj in self.location.contents:
-            if obj != self:
-                obj.msg(string % (self.get_display_name(obj),
-                                  location.get_display_name(obj) if location else "nowhere",
-                                  " from %s" % source_location.get_display_name(obj) if source_location else ""))
+        if source_location:
+            if msg:
+                string = msg
+            else:
+                string = "{object} arrives to {destination} from {origin}."
+        else:
+            string = "{object} arrives to {destination}."
+
+        origin = source_location
+        destination = self.location
+        exits = []
+        if origin:
+            exits = [o for o in destination.contents if o.location is destination and o.destination is origin]
+
+        if not mapping:
+            mapping = {}
+
+        mapping.update({
+                "object": self,
+                "exit": exits[0] if exits else "somewhere",
+                "origin": origin or "nowhere",
+                "destination": destination or "nowhere",
+        })
+
+        destination.msg_contents(string, exclude=(self, ), mapping=mapping)
 
     def at_after_move(self, source_location):
         """
